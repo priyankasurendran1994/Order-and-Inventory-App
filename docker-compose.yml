@@ -6,6 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - ENV=dev
       - DATABASE_URL=postgresql://user:password@db:5432/orderdb
       - REDIS_URL=redis://redis:6379
     depends_on:
@@ -17,6 +18,18 @@ services:
       - .:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
+
+  test:
+    build: .
+    command: pytest -v --disable-warnings
+    environment:
+      - ENV=test
+      - DATABASE_URL=sqlite:///./test.db
+      - REDIS_URL=
+    volumes:
+      - .:/app
+    depends_on:
+      - app
 
   db:
     image: postgres:15

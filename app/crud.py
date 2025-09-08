@@ -5,7 +5,8 @@ from typing import List, Optional, Tuple
 from app import models, schemas
 from app.database import redis_client
 import json
-from datetime import datetime
+import time  # ✅ Import time module properly
+from datetime import datetime  # ✅ Import datetime separately
 
 class ProductCRUD:
     def get(self, db: Session, product_id: int) -> Optional[models.Product]:
@@ -13,18 +14,25 @@ class ProductCRUD:
     
     def get_multi(self, db: Session, skip: int = 0, limit: int = 100) -> List[models.Product]:
         # Try to get from cache first
+        start = time.time()  # ✅ Now this works
+        print("start time to fetch data", start)
         if redis_client:
             cache_key = f"products_list_{skip}_{limit}"
             cached = redis_client.get(cache_key)
             if cached:
                 try:
                     products_data = json.loads(cached)
+                    end_time = time.time()
+                    print("Total duration if we read from redis cache", (end_time - start)*1000)
                     return [models.Product(**data) for data in products_data]
-                except Exception:
+                except Exception as e:
+                    print(f"Cache deserialization error: {e}")
                     pass
         
         # Order by ID ascending for consistent ordering
         products = db.query(models.Product).order_by(models.Product.id).offset(skip).limit(limit).all()
+        end_time1 = time.time()
+        print("Total duration if we read from DB", (end_time1 - start)*1000)
         
         # Cache the results
         if redis_client and products:
@@ -40,7 +48,11 @@ class ProductCRUD:
                 }
                 for p in products
             ]
-            redis_client.setex(cache_key, 300, json.dumps(products_data))  # 5 min cache
+            try:
+                redis_client.setex(cache_key, 300, json.dumps(products_data))  # 5 min cache
+                print(f"✅ Cached {len(products)} products with key: {cache_key}")
+            except Exception as e:
+                print(f"Cache storage error: {e}")
         
         return products
     
@@ -97,9 +109,15 @@ class ProductCRUD:
     
     def _invalidate_products_cache(self):
         if redis_client:
-            # Delete all product list cache keys
-            for key in redis_client.scan_iter(match="products_list_*"):
-                redis_client.delete(key)
+            try:
+                # Delete all product list cache keys
+                deleted_count = 0
+                for key in redis_client.scan_iter(match="products_list_*"):
+                    redis_client.delete(key)
+                    deleted_count += 1
+                print(f"🗑️ Invalidated {deleted_count} cache keys")
+            except Exception as e:
+                print(f"Cache invalidation error: {e}")
 
 class OrderCRUD:
     def get(self, db: Session, order_id: int) -> Optional[models.Order]:
@@ -152,65 +170,81 @@ class OrderCRUD:
         return orders, next_cursor, has_more
     
     def create_with_items(
-        self, 
-        db: Session, 
-        order_data: schemas.OrderCreate, 
-        idempotency_key: str
-    ) -> models.Order:
-        # Check if order already exists (idempotency)
-        existing_order = self.get_by_idempotency_key(db, idempotency_key)
-        if existing_order:
-            return existing_order
+    self, 
+    db: Session, 
+    order_data: schemas.OrderCreate, 
+    idempotency_key: str
+) -> models.Order:
+        from sqlalchemy.exc import IntegrityError
         
-        # Calculate total and validate stock with row-level locking
-        total_amount = 0
-        order_items_data = []
-        
-        for item in order_data.items:
-            # Lock the product row for update
-            product = product_crud.get_for_update(db, item.product_id)
-            if not product:
-                raise ValueError(f"Product with id {item.product_id} not found")
+        try:
+            # Calculate total and validate stock with row-level locking
+            total_amount = 0
+            order_items_data = []
             
-            if product.stock < item.quantity:
-                raise ValueError(f"Insufficient stock for product {product.name}. Available: {product.stock}, Requested: {item.quantity}")
+            for item in order_data.items:
+                # Lock the product row for update
+                product = product_crud.get_for_update(db, item.product_id)
+                if not product:
+                    raise ValueError(f"Product with id {item.product_id} not found")
+                
+                if product.stock < item.quantity:
+                    raise ValueError(f"Insufficient stock for product {product.name}. Available: {product.stock}, Requested: {item.quantity}")
+                
+                # Decrement stock
+                product.stock -= item.quantity
+                
+                item_total = product.price * item.quantity
+                total_amount += item_total
+                
+                order_items_data.append({
+                    "product_id": item.product_id,
+                    "quantity": item.quantity,
+                    "price": product.price
+                })
             
-            # Decrement stock
-            product.stock -= item.quantity
-            
-            item_total = product.price * item.quantity
-            total_amount += item_total
-            
-            order_items_data.append({
-                "product_id": item.product_id,
-                "quantity": item.quantity,
-                "price": product.price
-            })
-        
-        # Create order
-        db_order = models.Order(
-            idempotency_key=idempotency_key,
-            total_amount=total_amount
-        )
-        db.add(db_order)
-        db.flush()  # Get the order ID
-        
-        # Create order items
-        for item_data in order_items_data:
-            db_item = models.OrderItem(
-                order_id=db_order.id,
-                **item_data
+            # Create order
+            db_order = models.Order(
+                idempotency_key=idempotency_key,
+                total_amount=total_amount
             )
-            db.add(db_item)
-        
-        db.commit()
-        db.refresh(db_order)
-        
-        # Invalidate product cache since stock changed
-        product_crud._invalidate_products_cache()
-        
-        return db_order
+            db.add(db_order)
+            db.flush()  # Get the order ID
+            
+            # Create order items
+            for item_data in order_items_data:
+                db_item = models.OrderItem(
+                    order_id=db_order.id,
+                    **item_data
+                )
+                db.add(db_item)
+            
+            db.commit()
+            db.refresh(db_order)
+            
+            # Invalidate product cache since stock changed
+            product_crud._invalidate_products_cache()
+            
+            return db_order
+            
+        except IntegrityError as e:
+            # Rollback the transaction
+            db.rollback()
+            
+            # Check if it's a duplicate idempotency key error
+            if "ix_orders_idempotency_key" in str(e) or "idempotency_key" in str(e):
+                print(f"🔄 Idempotent request detected via IntegrityError - fetching existing order")
+                # Fetch the existing order
+                existing_order = self.get_by_idempotency_key(db, idempotency_key)
+                if existing_order:
+                    return existing_order
+                else:
+                    # This shouldn't happen, but if it does, re-raise the original error
+                    raise e
+            else:
+                # Some other integrity error, re-raise
+                raise e
 
-# Create CRUD 
+# Create CRUD instances
 product_crud = ProductCRUD()
 order_crud = OrderCRUD()

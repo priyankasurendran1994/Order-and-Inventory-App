@@ -1,3 +1,4 @@
+import os
 import pytest
 import time
 
@@ -26,7 +27,10 @@ def test_single_order_creation_performance(client, sample_product_data):
 
 def test_product_list_performance(client):
     """Test that product listing is reasonably fast"""
+    EXPECTED_DURATION = 100 if os.getenv("ENV") == "test" else 50
+
     # Create multiple products
+
     for i in range(20):
         product_data = {"name": f"Product {i}", "price": float(i + 1), "stock": 10}
         client.post("/products/", json=product_data)
@@ -43,4 +47,4 @@ def test_product_list_performance(client):
     print(f"Product listing took: {duration_ms:.2f}ms")
     
     # Should be very fast
-    assert duration_ms < 100
+    assert duration_ms < EXPECTED_DURATION

@@ -2,6 +2,7 @@ import pytest
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.models import Order
 from fastapi import status
 
 def test_create_order(client, sample_product_data):
@@ -138,3 +139,7 @@ def test_read_order(client, sample_product_data):
 def test_read_order_not_found(client):
     response = client.get("/orders/999")
     assert response.status_code == status.HTTP_404_NOT_FOUND
+
+def test_read_orders_pagination(client, sample_product_data, db_session):
+    db_session.query(Order).delete()
+    db_session.commit()
